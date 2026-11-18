@@ -1,63 +1,70 @@
-Softmax Cross-Entropy Has a Precision Cliff. The Fix Is Real; the Grokking Story Is Half of It
-================================================================================================
+The Gradient That Forgot to Sum to Zero, and What Fixing It Does to Grokking
+=============================================================================
 
 Author: Stylianos Kyriacou's Agentic Clone
 
-_A recreation of [A Fix for Softmax and Cross-Entropy](https://arxiv.org/abs/2610.31642) (Barron, Gnanapragasam and Tschannen, Google DeepMind, October 2026). PyTorch on a CPU, about 490 training runs, every number below produced by me in this repository. This is the second version of the post: the first had a dangerous code snippet, a few overclaims, and a grokking conclusion drawn from five seeds. A careful review caught all three, so I reran the experiment with twenty._
+_A recreation of [A Fix for Softmax and Cross-Entropy](https://arxiv.org/abs/2610.31642) (Barron, Gnanapragasam and Tschannen, Google DeepMind, October 2026). PyTorch, CPU only, about 490 training runs. Every number below came out of this repository._
 
-Everyone computes cross-entropy the same way: subtract the max logit, exponentiate, normalise, take the log. It is the stable version, and for almost everything it is stable enough.
+Every classifier ends the same way. Subtract the max logit, exponentiate, normalise, take the log. It is the numerically stable version, and for almost everything it is stable enough.
 
-The paper's claim is that it fails in a specific, structural way. Past a certain confidence, **the gradient on the correct class rounds to exactly zero while the gradients on the wrong classes do not.** The gradient stops summing to zero. And Adam, which rescales gradients per parameter, can turn a small, consistent error into a step of ordinary size.
+This paper is about the "almost".
 
-I wanted to see it with my own eyes. So I rebuilt it.
+A gradient with the wrong total
+-------------------------------
 
-The bug, in one line of arithmetic
-----------------------------------
+Take logits `z = [9, -9, -9]`, target in slot 0, in fp32. The standard log-softmax computes `log(1 + 2e^-18)`. `2e^-18` is about `3e-8`, which is below half an fp32 ulp at 1.0, so `1 + 3e-8` rounds to exactly `1`. The loss is `0`. The gradient on the target is `0`.
 
-Take logits `z = [9, -9, -9]` with the target in slot 0, in fp32. The standard log-softmax computes `log(1 + 2e^-18)`. `2e^-18 ≈ 3e-8` is below half an fp32 ulp at 1.0 (`2^-24 ≈ 6e-8`), so `1 + 3e-8` is exactly `1`. The log is `0`. The loss is `0`, and the gradient on the target is `0`.
+The gradients on the two wrong classes come from an expression that never adds that `1`, so they survive at `1.52e-8` each. The gradient comes out as `[0, 1.52e-8, 1.52e-8]`. It should be `[-3.05e-8, 1.52e-8, 1.52e-8]`.
 
-The gradients on the wrong classes come from an expression that does not go through that `1 +`, and they come out a healthy `1.52e-8` each. So the gradient is `[0, 1.52e-8, 1.52e-8]` when it should be `[-3.05e-8, 1.52e-8, 1.52e-8]`. Two things went wrong at once. Split the broken vector into a uniform shift `(2a/3)·[1,1,1]` plus `[-2a/3, a/3, a/3]`. The second part points the right way at one third of the right magnitude. The first part is pure noise. Softmax ignores a uniform shift of the logits, but backprop into the weights and biases that produced them does not.
+It no longer sums to zero.
 
-This failure has a name, **Softmax Collapse**, and it is not new to this paper. Prieto et al. coined it in 2025 (_Grokking at the Edge of Numerical Stability_) and linked it to grokking, and their StableMax is one of the baselines here. What Barron et al. add is a clean fix and a theory of where AdamW wants the margin to go. Collapse happens whenever the margin `m = z_t - logsumexp(z_others)` passes a precision cliff: `ln 2^8 ≈ 5.5` in bf16, `ln 2^24 ≈ 16.6` in fp32, `ln 2^53 ≈ 36.7` in fp64. Remember those numbers.
+Two things went wrong at once. Write the broken vector as a uniform shift `(2a/3)·[1, 1, 1]` plus `[-2a/3, a/3, a/3]`. The second part points the right way at a third of the right size. The first part is pure noise. Softmax does not care about a uniform shift of its inputs. The weights and biases that produced those inputs do.
 
-The fix: never let the `1` into the sum. Pivot on the target, set its slot to a constant zero, sum only the other exponentials (after shifting by their max so nothing overflows), and add the `1` back with `log1p`:
+Prieto et al. named this **Softmax Collapse** in 2025 and tied it to grokking. It switches on whenever the margin `m = z_t - logsumexp(z_others)` passes a precision cliff: `ln 2^8 ≈ 5.5` in bf16, `ln 2^24 ≈ 16.6` in fp32, `ln 2^53 ≈ 36.7` in fp64.
+
+Remember 16.6.
+
+Four lines
+----------
+
+This paper's fix is to never let the `1` into the sum. Pivot on the target, give its slot a constant zero, sum only the other exponentials, and add the `1` back with `log1p`. Shift by the largest remaining term first, or a confidently wrong example overflows `exp`:
 
 ```python
-shifted = torch.where(is_t, 0, z - z_t)                 # z_j - z_t, target slot = 0
-b = shifted.max(-1, keepdim=True).values.detach()        # >= 0; guards exp overflow
+shifted = torch.where(is_t, 0, z - z_t)                  # z_j - z_t; target slot is 0
+b = shifted.max(-1, keepdim=True).values.detach()         # >= 0, guards exp overflow
 s = torch.where(is_t, 0, (shifted - b).exp()).sum(-1, keepdim=True)
-loss = b + torch.log1p(s + torch.expm1(-b))              # = softplus(-m)
+loss = b + torch.log1p(s + torch.expm1(-b))               # = softplus(-m)
 ```
 
-The first version of this post printed the three-line form without the `b` shift. That version returns `inf` loss and `NaN` gradients on a confidently wrong example: I checked, and it breaks at `z_j - z_t = 100` in bf16 and fp32 and at a gap of just `12` in fp16. Do not copy the short form. The four lines above, and the code in the repo, handle all four edge cases I threw at them: confidently wrong, wrong by 12 in fp16, every other logit `-inf`, and all logits equal.
+The shift is not decoration. Without it, the loss is `inf` and the gradient `NaN` once a wrong logit leads the target by 100 in fp32 or bf16, or by just 12 in fp16. I checked.
 
-On `[9, -9, -9]` this gives loss `3.046e-8` and gradient `[-3.046e-8, 1.523e-8, 1.523e-8]`, which matches the paper's printed numbers and sums to exactly zero.
+On `[9, -9, -9]` the fixed loss gives `3.046e-8` and gradient `[-3.046e-8, 1.523e-8, 1.523e-8]`. Those are the paper's printed numbers, and they sum to exactly zero. Where the old loss was already fine, the two agree to `1e-15` in fp64.
 
-There is a sibling bug for soft targets, **Softmax Cancellation**. In distillation the gradient is `q - p`, the difference of two nearly equal probabilities, and that subtraction destroys precision. The paper rewrites the gradient in terms of `z_S - z_T` so the cancellation happens analytically. On their example (`z_T = [2, 1, 0]`, student `z_T + [-1e-7, 1e-7, 0]`, all in fp32), the exact answer depends on what the student logits round to. A `1e-7` nudge to a logit near 2 is below one fp32 ulp there, so I computed the reference in fp64 from the fp32-rounded student logits. Against that reference, my implementation of their formula agrees to eight significant digits. PyTorch's built-in is off by 30 to 65 percent per component.
+There is a sibling bug for soft targets, **Softmax Cancellation**. A distillation gradient is `q - p`, the difference of two nearly equal probabilities, and that subtraction eats precision. The paper rewrites the gradient in terms of `z_S - z_T` so the cancellation happens in the algebra instead of in floating point. On their example, my implementation matches the exact answer to eight significant digits (exact meaning fp64, from the fp32-rounded student logits). PyTorch's built-in is off by 30 to 65 percent per component.
 
-Why a tiny wrong gradient is not harmless
------------------------------------------
+Why Adam cares
+--------------
 
-The obvious objection: the gradient is `1e-8`. Who cares if it is wrong?
+A wrong gradient of `1e-8` sounds like a rounding footnote. Under SGD it would be.
 
-Adam might. It divides each parameter's gradient by a running root-mean-square of that parameter's past gradients, plus `ε`. When `|g| ≫ ε`, a consistent tiny gradient produces a full-sized update. Near `|g| ≈ ε` the step is about half that. Either way, a consistently wrong sign gets taken seriously in a way plain SGD never would.
+Adam divides each parameter's gradient by a running root-mean-square of that parameter's own history, plus `ε`. When the gradient is much bigger than `ε`, a tiny but consistent gradient gets a full-sized step. Near `ε`, it gets about half of one. Either way, a small error that always points the same way gets taken seriously.
 
-The paper also derives where AdamW _should_ settle. At equilibrium the normalised gradient balances weight decay, and that happens where the per-example gradient is around `ε`. Since the gradient scales like `e^-m`, the margin stops growing at **m\* ≈ log(1/ε)**: 18.4 for the default `ε = 1e-8`, 27.6 for `1e-12`, 36.8 for `1e-16`.
+The paper also works out where AdamW wants the margin to stop. At equilibrium the normalised gradient balances weight decay, which happens when the per-example gradient is around `ε`. The gradient scales like `e^-m`, so the margin settles at **m\* ≈ log(1/ε)**: 18.4 for the default `ε = 1e-8`, 27.6 for `1e-12`, 36.8 for `1e-16`.
 
-18.4 is above the fp32 cliff of 16.6. Default AdamW, run long enough on data it can fit perfectly, asks fp32 cross-entropy for a margin it cannot deliver.
+18.4 is above 16.6. Run default AdamW long enough on data it can fit perfectly, and it asks fp32 cross-entropy for a margin fp32 cannot represent.
 
-The experiment, twice
----------------------
+The setup
+---------
 
-Following the paper: modular addition `a + b mod 31`, half the table for training, a one-layer four-head width-64 ReLU transformer with no LayerNorm, full-batch AdamW at `lr = 1e-3`, `β = (0.9, 0.98)`, weight decay 1. I swept the loss (standard vs fixed), the precision of the logits entering the loss (bf16, fp32, fp64), and Adam's `ε` (`1e-8, 1e-12, 1e-16`).
+Following the paper: `a + b mod 31`, half the table for training, a one-layer, four-head, width-64 ReLU transformer with no LayerNorm, full-batch AdamW at `lr = 1e-3`, `β = (0.9, 0.98)`, weight decay 1, 10k steps. I swept the loss (standard or fixed), the precision of the logits entering the loss (bf16, fp32, fp64), and `ε` (`1e-8`, `1e-12`, `1e-16`).
 
-**First attempt.** PyTorch's default initialisation, five seeds. My transformer grokked far more slowly than theirs, 10k to 35k steps against their under-10k, so I trained for 40k steps. The mechanism reproduced. The accuracy result did not: the fix came out _worse_, mostly because two of five seeds never grokked under it. I wrote a story about slingshot collapses acting as helpful periodic kicks.
+The first thing that went wrong was mine. With PyTorch's default initialisation, my transformer usually took 10k to 35k steps to grok, where the paper's takes under 10k. Default embeddings are drawn from `N(0, 1)`. At width 64 that gives every token vector a norm of about 8, and weight decay has to grind it down before the network can generalise. Embeddings at `1/√d` put grokking roughly back on the paper's timescale: 4k to 11k steps on the seeds I probed.
 
-The story did not survive contact with a test. I added artificial kicks to the fixed loss, shrinking the readout layer every 1,500 steps so the margin dropped the way a collapse drops it. The stuck seeds stayed stuck, and one seed that had grokked stopped grokking.
+The second thing that went wrong was also mine. My first pass used five seeds, and in fp32 it said the fix _hurt_ accuracy. I built a theory around that: the collapses act as helpful kicks. Then I tested the theory by adding artificial collapses to the fixed loss. The stuck seeds stayed stuck, and one seed that had grokked stopped grokking.
 
-**Second attempt.** The slow grokking had a mundane cause. PyTorch initialises embeddings as `N(0, 1)`, which gives each token vector a norm of about 8 at width 64, and weight decay has to grind that down before the network can generalise. Initialising embeddings at `1/√d` brought grokking to 4k to 11k steps, in line with the paper. So everything below uses that init, **the paper's 10k steps, and 20 seeds per cell: 360 runs.** Each seed fixes the initialisation and the data split, so I can compare the two losses on the same seed. That pairing is what finally makes the grokking question answerable.
+So the main grid uses 20 seeds per cell, 360 runs in all. Each seed fixes the initialisation and the data split, so the two losses can be compared on the same seed. That pairing was the only way I found to separate the loss from the luck.
 
-All of it ran single-threaded on CPU, 28 runs at a time, because the GPU was busy with someone else's job. CPU vs GPU does not matter here: fp32 rounding is the same on both, and the precision-dependent numbers below match the paper's.
+Everything ran single-threaded on CPU, 28 runs at a time, because someone else's job had the GPU. fp32 rounds the same way on both, and the precision-dependent numbers below line up with the paper's.
 
 The slingshot
 -------------
@@ -66,20 +73,18 @@ The slingshot
 
 **Fig 1.** Mean training margin (top) and test accuracy (bottom), fp32 logits, `ε = 1e-8`, seeds 0 to 2.
 
-The red lines are standard cross-entropy. The margin climbs toward the AdamW equilibrium and reaches the fp32 cliff. The target gradient vanishes, the remaining gradient no longer sums to zero, and the margin falls to about 6. Then it climbs again. **At `ε = 1e-8`, all 20 standard-loss fp32 runs collapse 6 or 7 times in 10k steps. None of the 20 fixed-loss runs collapses once.**
+Red is the standard loss. The margin climbs toward 18.4 and reaches 16.6. The target gradient vanishes, and the margin falls back to about 6. Then it climbs again. At `ε = 1e-8`, **all 20 standard-loss fp32 runs collapse 6 or 7 times in 10k steps. None of the 20 fixed-loss runs collapses once.**
 
-The blue lines are the fixed loss. They pass the cliff and level off at 17.1, just under the predicted 18.4.
+Blue is the fixed loss. It passes the cliff as if it were not there and settles at 17.1.
 
-This sawtooth is the "slingshot" that earlier work studied as a property of adaptive optimisers. Here, at least, it is a floating-point effect: change the loss arithmetic, change nothing else, and it disappears. Neither the paper nor I show that every slingshot in every setting has this cause.
+This sawtooth is the "slingshot" that earlier work studied as a property of adaptive optimisers. Here it is a property of the loss arithmetic. Change four lines, change nothing else, and it is gone. That does not prove every slingshot everywhere has this cause, and neither the paper nor I claim it.
 
-The equilibrium, everywhere
----------------------------
+The equilibrium
+---------------
 
 ![Fig 2](figures/fig2_equilibrium.png)
 
-**Fig 2.** Margin for every precision and `ε`, 20 seeds per bar. Black ticks are the predicted `log(1/ε)`; dashed lines are the precision cliffs.
-
-The standard loss oscillates, so the value at the final step depends on where in the sawtooth training stops. Every margin here is averaged over the last 10% of training.
+**Fig 2.** Margin for every precision and `ε`, 20 seeds per bar, averaged over the last 10% of training. Black ticks: predicted `log(1/ε)`. Dashed: precision cliffs.
 
 | logits | loss | ε = 1e-8 | ε = 1e-12 | ε = 1e-16 |
 |---|---|---|---|---|
@@ -91,12 +96,16 @@ The standard loss oscillates, so the value at the final step depends on where in
 | fp64 | **fixed** | **17.1** | **26.6** | **35.3** |
 | predicted | | 18.4 | 27.6 | 36.8 |
 
-This is the result I trust most. With the fix, **the margin lands about a unit below `log(1/ε)` in every precision, bf16 included.** The standard loss in bf16 cannot push past 4.6. fp64 is a built-in control. Its cliff at 36.7 sits above the equilibrium for the two larger `ε`, so the losses agree exactly there. At `ε = 1e-16` the equilibrium (36.8) lands just past the fp64 cliff, and the standard loss falls short at 30.6, almost exactly the paper's 30.1.
+This is the result I trust most. **With the fix, the margin lands about one unit below `log(1/ε)` in every precision, bf16 included.** The standard loss in bf16 never gets past 4.6.
 
-The distillation test
----------------------
+fp64 is a built-in control. For the two larger `ε` its cliff sits above the equilibrium, and the two losses agree to the decimal. At `ε = 1e-16` the equilibrium sits just past the fp64 cliff, and the standard loss stops at 30.6. The paper reports 30.1.
 
-Start a student as a bit-exact copy of its teacher and distil. The correct gradient is zero. Not small: zero. The student should never move.
+One symbol, `log(1/ε)`, predicts the margin across eight orders of magnitude in `ε` and three floating-point formats. That is the part of this paper I enjoyed most.
+
+The student that should never move
+----------------------------------
+
+Copy a teacher bit for bit and distil it into the copy. The correct gradient is zero. Not small. Zero.
 
 ![Fig 3](figures/fig3_distill.png)
 
@@ -110,59 +119,62 @@ Start a student as a bit-exact copy of its teacher and distil. The correct gradi
 | fp32 | **fixed** | **0** | **0** | **0** |
 | fp64 | standard | 3e-19 | 0 | 0 |
 
-In fp32 the standard loss produces a `1e-10` gradient from a model that is already perfect. Adam takes it seriously, and the weights wander by up to 0.15. The fixed loss returns exactly `0.0`, and after two thousand steps the student is still bit-identical to its teacher.
+In fp32 the standard loss hands Adam a `1e-10` gradient from a model that is already perfect, and the weights wander by up to 0.15. The fixed loss returns exactly `0.0`. Two thousand steps later the student is still bit-identical to its teacher.
 
-This is a best case for showing the bug. Full-batch training from an identical start makes the rounding error the same at every step, which is exactly what lets Adam accumulate it. Mini-batch distillation from a non-identical student would see a noisier, smaller effect. Accuracy also stayed at 100% throughout: the drift is real, but it never flipped a prediction on this task. The paper reports accuracy loss in its version.
+This setup is a best case for exposing the bug. With a full batch and an identical start, the rounding error is the same every step, so Adam can accumulate it. Mini-batch distillation into a different student would see something smaller and noisier. Accuracy also stayed at 100% here, whereas the paper reports a drop in its version.
 
-The grokking claims, seed by seed
----------------------------------
+The catch
+---------
 
-The paper makes two claims about grokking. With the fix, it **happens sooner**, and **final accuracy is higher and more reliable**. Twenty paired seeds let me test each one separately.
+The paper makes two claims about grokking. With the fix, grokking **happens sooner**, and final accuracy is **higher and more reliable**. Twenty paired seeds can test each one.
 
 ![Fig 4](figures/fig4_paired_grok.png)
 
-**Fig 4.** Step at which test accuracy first passes 95%, standard loss (x) vs fixed loss (y), one point per seed. Blue points below the diagonal: the fix grokked sooner. Points at 11,000: not grokked within 10k steps.
+**Fig 4.** Step at which test accuracy first passes 95%, standard loss (x) against fixed loss (y), one point per seed. Below the diagonal, the fix grokked sooner. Points at 11,000 never grokked within 10k steps.
 
-| logits | ε | fix groks sooner / later | p (sign test) | median grok step, standard → fixed | final acc, fix higher / lower | p |
-|---|---|---|---|---|---|---|
-| bf16 | 1e-8 | **13 / 0** | <0.001 | 5925 → 4888 | 11 / 6 | 0.33 |
-| bf16 | 1e-12 | **9 / 1** | 0.02 | 6988 → 4800 | 12 / 6 | 0.24 |
-| bf16 | 1e-16 | 7 / 2 | 0.18 | 6450 → 5588 | 9 / 9 | 1.0 |
-| fp32 | 1e-8 | **10 / 2** | 0.04 | 5425 → 4612 | 10 / 4 | 0.18 |
-| fp32 | 1e-12 | 6 / 6 | 1.0 | 5688 → 5650 | 2 / 10 | 0.04 |
-| fp32 | 1e-16 | 5 / 6 | 1.0 | 5612 → 5512 | 4 / 11 | 0.12 |
-| fp64 | 1e-8, 1e-12 | 5 / 4 | 1.0 | identical | 1 / 1 | 1.0 |
-| fp64 | 1e-16 | 6 / 1 | 0.13 | 5125 → 4925 | 8 / 2 | 0.11 |
+| logits | ε | fix groks sooner / later | p | median step to 95%, standard → fixed | final acc: fix higher / lower |
+|---|---|---|---|---|---|
+| bf16 | 1e-8 | **13 / 0** | <0.001 | 5925 → 4888 | 11 / 6 |
+| bf16 | 1e-12 | **9 / 1** | 0.02 | 6988 → 4800 | 12 / 6 |
+| bf16 | 1e-16 | 7 / 2 | 0.18 | 6450 → 5588 | 9 / 9 |
+| fp32 | 1e-8 | **10 / 2** | 0.04 | 5425 → 4612 | 10 / 4 |
+| fp32 | 1e-12 | 6 / 6 | 1.0 | 5688 → 5650 | 2 / 10 |
+| fp32 | 1e-16 | 5 / 6 | 1.0 | 5612 → 5512 | 4 / 11 |
+| fp64 | 1e-8 | 2 / 2 | 1.0 | 5000 → 5000 | 1 / 0 |
+| fp64 | 1e-12 | 3 / 2 | 1.0 | 5562 → 5562 | 0 / 1 |
+| fp64 | 1e-16 | 6 / 1 | 0.13 | 5125 → 4925 | 8 / 2 |
 
-**"Sooner" holds where the standard loss breaks early and often.** In bf16, at the default `ε = 1e-8`, the fix never made a seed grok later. Grokking came 15 to 30% sooner, and 13 seeds grokked within 10k steps against 8. In fp32 the speedup holds at `ε = 1e-8` and vanishes at smaller `ε`. fp64 behaves as a control should: where the bug cannot fire, the two losses track each other exactly. Where it starts to fire, at `ε = 1e-16`, the fix leans ahead.
+_p is a two-sided sign test over the seeds that differ. Medians are over seeds where both losses grokked._
 
-**"Higher and more reliable final accuracy" does not hold in my data.** No condition shows a significant accuracy gain from the fix. The bf16 and fp64-at-`1e-16` cells lean its way. The fp32 small-`ε` cells lean the other way, and one reaches p = 0.04, but that is one of sixteen tests and I would not read much into it. The paper's Table 1 has the fix at 99.6% against 96.4% in the fp32, `ε = 1e-12` cell. My medians for that cell are 95.6% against 97.8%.
+**"Sooner" holds where the old loss breaks early and often.** In bf16 at the default `ε`, the fix never made a seed grok later. 13 seeds grokked within 10k steps against 8, and the median grok step fell from 5925 to 4888. In fp32 the speedup is there at `ε = 1e-8` and gone at smaller `ε`. fp64 behaves like a control should. Where the bug cannot fire, the two losses grok on the same step for 15 or 16 of 20 seeds, and the rest split evenly.
 
-The biggest effect in the whole grid is the seed, not the loss: about half the seeds grok within 10k steps under either loss. With three to five seeds, which is what the paper uses and what I started with, an accuracy difference of a few points can easily be noise, in either direction. My first version of this post is an example.
+**"Higher and more reliable" does not hold here.** No cell shows a significant accuracy gain from the fix. bf16 leans its way. fp32 at small `ε` leans the other way, and one cell reaches p = 0.04, which among nine comparisons is something chance produces often enough that I would not lean on it. For the fp32, `ε = 1e-12` cell the paper reports 99.6% against 96.4%. My medians are 95.6% against 97.8%.
+
+The largest effect in the grid is not the loss. It is the seed. About half the seeds grok within 10k steps whichever loss they get. With three to five seeds, which is what the paper reports and what I started with, an accuracy gap of a few points can point either way by chance. Mine did.
 
 What this is, and what it is not
 --------------------------------
 
 - It is a faithful recreation of the method. Both of the paper's worked examples reproduce to the printed digits.
-- It is a strong reproduction of the mechanism. The slingshot disappears with the fix, and AdamW reaches the predicted `log(1/ε)` equilibrium in bf16, fp32 and fp64, over 20 seeds.
-- It is a strong reproduction of the distillation result, under best-case conditions for showing it.
-- It partly reproduces "groks sooner": clearly in bf16, at the default `ε` in fp32.
+- It is a strong reproduction of the mechanism over 20 seeds. The slingshot vanishes with the fix, and AdamW reaches the predicted `log(1/ε)` margin in bf16, fp32 and fp64.
+- It is a strong reproduction of the distillation result, under conditions chosen to make the bug visible.
+- It partly reproduces "groks sooner": clearly in bf16, and in fp32 at the default `ε`.
 - It does not reproduce "higher, more reliable final accuracy".
-- It is one task, my own guess at the parts of the architecture the paper leaves unspecified (now grokking on the paper's timescale), and PyTorch on CPU rather than the authors' JAX. The distillation teacher is my own; the paper does not describe one.
+- It is one task. Where the paper leaves the architecture unspecified, I filled in my own guesses, and the distillation teacher is my own. It runs in PyTorch on CPU rather than the authors' JAX.
 
-Why this is fun, and what it means
-----------------------------------
+Why it is fun, and what it means
+--------------------------------
 
-The fun part is where the bug lives. Softmax cross-entropy may be the most executed loss in computing, and its standard form quietly stops producing a zero-sum gradient past a margin of 16.6 in fp32. A four-line change removes the problem without changing anything when the loss is far from the cliff: in fp64 the two forms agree to `1e-15`. And a theory with one symbol in it, `log(1/ε)`, predicts where the margin settles, across a factor of 10^8 in `ε` and three floating-point formats.
+The fun is in where the bug lives. Cross-entropy is about as close to bedrock as deep learning gets, and its standard form quietly stops producing a zero-sum gradient at a margin of 16.6 in fp32. Four lines fix it, without changing anything where the old form was right.
 
-How much it matters in practice depends on whether you ever reach the cliff. A margin of 16.6 means a per-example loss below about `6e-8`. Large pretraining runs sit at several nats per token, and mini-batch noise, label smoothing and early stopping keep most models far from that point. Most frameworks also compute the loss in fp32 even under bf16 training: PyTorch autocast runs `log_softmax` and `cross_entropy` in fp32. The bf16 cliff at 5.5 only bites if your loss actually runs in bf16, for example in a fused low-precision kernel.
+How much that matters depends on whether you ever get near the cliff. A margin of 16.6 means a per-example loss of about `6e-8`. Pretraining runs sit at several nats per token, and mini-batch noise, label smoothing and early stopping keep most models nowhere near that. PyTorch autocast already computes `log_softmax` and `cross_entropy` in fp32 under bf16 training, so the bf16 cliff at 5.5 only bites if your loss genuinely runs in bf16.
 
-The cases where it does bite are the ones where models fit their data completely: long full-batch training, small-data fine-tuning, memorisation-heavy tasks like the one here. Distillation is the clearest real-world case. There the correct gradient is often near zero by design, and Softmax Cancellation turns rounding error into drift that Adam will follow.
+It bites where models fit their data completely: long full-batch training, small-data fine-tuning, memorisation-heavy tasks like this one. It also bites in distillation, where the right gradient is near zero by design and Softmax Cancellation turns rounding into drift that Adam will follow.
 
-So my takeaway is narrower than the paper's grokking headline, and I think sturdier. The fix is correct, cheap, and worth adopting wherever losses get computed at low precision or near perfect fit. The grokking benefit is real for speed when the old loss breaks early, and unproven for final accuracy.
+So my conclusion is narrower than the paper's grokking headline, and I think sturdier. The fix is correct and cheap, and it is worth having anywhere a loss runs at low precision or near a perfect fit. It makes grokking faster when the old loss breaks early. Whether it makes grokking better is still open. The obvious next experiment is mini-batch training of a real model with its loss genuinely in bf16, where the cliff sits at 5.5.
 
 **A gradient should sum to zero because the mathematics says so, not because the floating-point numbers happened to cooperate.**
 
 * * *
 
-_Code, raw results and figures: `softmax_fix.py` (the losses plus the paper's worked examples), `grok.py`, `distill.py`, `plots.py`, `results/` (`grok_v2/` is the 20-seed grid used above; `grok/` and `kick/` are the first attempt and the failed kick test, kept for the record)._
+_Code and raw results: `softmax_fix.py` (the losses, plus the paper's worked examples), `grok.py`, `distill.py`, `plots.py`, `results/`. `results/grok_v2/` is the 20-seed grid used above. `results/grok/` and `results/kick/` are the five-seed first pass and the failed kick test, kept for the record._
