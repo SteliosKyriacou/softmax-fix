@@ -32,12 +32,17 @@ class Block(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, p, d=64, h=4, layers=1):
+    def __init__(self, p, d=64, h=4, layers=1, init="torch"):
         super().__init__()
         self.tok = nn.Embedding(p + 1, d)       # p numbers + '=' token
         self.pos = nn.Parameter(torch.randn(3, d) * 0.02)
         self.blocks = nn.ModuleList([Block(d, h) for _ in range(layers)])
         self.unembed = nn.Linear(d, p, bias=False)
+        if init == "small":      # embeddings at 1/sqrt(d) instead of torch's N(0, 1)
+            nn.init.normal_(self.tok.weight, std=d ** -0.5)
+        elif init == "gpt":      # every weight N(0, 0.02), biases 0
+            for n_, w in self.named_parameters():
+                nn.init.zeros_(w) if n_.endswith("bias") else nn.init.normal_(w, std=0.02)
 
     def forward(self, x):
         h = self.tok(x) + self.pos
@@ -46,7 +51,8 @@ class Transformer(nn.Module):
         return self.unembed(h[:, -1])
 
 
-def run(loss_name, prec, eps, seed, p=31, steps=10_000, lr=1e-3, wd=1.0, frac=0.5, log_every=25, device="cpu"):
+def run(loss_name, prec, eps, seed, p=31, steps=10_000, lr=1e-3, wd=1.0, frac=0.5, log_every=25, device="cpu",
+        init="torch", kick_every=0, kick_scale=0.35):
     g = torch.Generator().manual_seed(seed)
     a, b = torch.meshgrid(torch.arange(p), torch.arange(p), indexing="ij")
     X = torch.stack([a.flatten(), b.flatten(), torch.full((p * p,), p)], 1)
@@ -56,7 +62,7 @@ def run(loss_name, prec, eps, seed, p=31, steps=10_000, lr=1e-3, wd=1.0, frac=0.
     Xtr, Ytr, Xte, Yte = [t.to(device) for t in (X[perm[:n]], Y[perm[:n]], X[perm[n:]], Y[perm[n:]])]
 
     torch.manual_seed(seed)
-    model = Transformer(p).to(device)
+    model = Transformer(p, init=init).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.98), eps=eps, weight_decay=wd)
     loss_fn = {"standard": standard_ce, "fixed": fixed_ce}[loss_name]
     dt = DTYPES[prec]
@@ -81,6 +87,10 @@ def run(loss_name, prec, eps, seed, p=31, steps=10_000, lr=1e-3, wd=1.0, frac=0.
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        if kick_every and step > 0 and step % kick_every == 0:
+            # artificial "slingshot": shrink the readout so the margin drops, like a collapse does
+            with torch.no_grad():
+                model.unembed.weight.mul_(kick_scale)
     return hist
 
 
@@ -92,10 +102,13 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--steps", type=int, default=10_000)
     ap.add_argument("--out", default="results/grok")
+    ap.add_argument("--init", default="torch")
+    ap.add_argument("--kick_every", type=int, default=0)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
-    h = run(a.loss, a.prec, a.eps, a.seed, steps=a.steps)
-    fn = f"{a.out}/{a.loss}_{a.prec}_eps{a.eps:g}_s{a.seed}.json"
+    h = run(a.loss, a.prec, a.eps, a.seed, steps=a.steps, init=a.init, kick_every=a.kick_every)
+    tag = (f"_{a.init}" if a.init != "torch" else "") + (f"_kick{a.kick_every}" if a.kick_every else "")
+    fn = f"{a.out}/{a.loss}_{a.prec}_eps{a.eps:g}{tag}_s{a.seed}.json"
     json.dump(dict(vars(a), hist=h), open(fn, "w"))
     print(f"{fn}: test_acc={h['test_acc'][-1]:.3f} margin={h['margin'][-1]:.2f} ({time.time()-t0:.0f}s)")
